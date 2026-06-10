@@ -282,11 +282,15 @@ public struct GeminiLanguageModel: LanguageModel {
 
         var transcript = session.transcript
         var usage = LanguageModelUsage()
+        // Raw model contents for tool-call turns, in transcript order. They
+        // carry the thought signatures Gemini 3 requires on replayed
+        // function-call parts; the transcript reconstruction cannot.
+        var rawToolCallContents: [GeminiContent] = []
 
         // Multi-turn conversation loop for tool calling
         while true {
             let params = try createGenerateContentParams(
-                contents: transcript.toGeminiContent(),
+                contents: transcript.toGeminiContent(rawToolCallContents: rawToolCallContents),
                 tools: geminiTools,
                 generating: type,
                 options: options,
@@ -310,7 +314,7 @@ public struct GeminiLanguageModel: LanguageModel {
 
             let functionCalls: [GeminiFunctionCall] =
                 firstCandidate.content.parts?.compactMap { part in
-                    if case .functionCall(let call) = part { return call }
+                    if case .functionCall(let call, _) = part { return call }
                     return nil
                 } ?? []
 
@@ -332,6 +336,7 @@ public struct GeminiLanguageModel: LanguageModel {
                 case .invocations(let invocations):
                     if !invocations.isEmpty {
                         transcript.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+                        rawToolCallContents.append(firstCandidate.content)
 
                         for invocation in invocations {
                             transcript.append(.toolOutput(invocation.output))
@@ -778,8 +783,13 @@ private func toJSONValue(_ toolOutput: Transcript.ToolOutput) throws -> [String:
 // MARK: - Supporting Types
 
 extension Transcript {
-    fileprivate func toGeminiContent() -> [GeminiContent] {
+    /// - Parameter rawToolCallContents: raw model contents for the tool-call
+    ///   turns of this conversation, in order. When available they are sent
+    ///   verbatim (preserving Gemini 3 thought signatures) instead of being
+    ///   reconstructed from the transcript.
+    fileprivate func toGeminiContent(rawToolCallContents: [GeminiContent] = []) -> [GeminiContent] {
         var messages = [GeminiContent]()
+        var toolCallTurnIndex = 0
         for item in self {
             switch item {
             case .instructions(let instructions):
@@ -804,17 +814,24 @@ extension Transcript {
                     )
                 )
             case .toolCalls(let toolCalls):
-                // Add model's response with function calls
-                let functionCallParts: [GeminiPart] = toolCalls.map { call in
-                    let args = try? fromGeneratedContent(call.arguments)
-                    return .functionCall(GeminiFunctionCall(name: call.toolName, args: args))
-                }
-                messages.append(
-                    .init(
-                        role: .model,
-                        parts: functionCallParts
+                // Add model's response with function calls. Prefer the raw
+                // model content (carries thought signatures) over a
+                // reconstruction from the transcript.
+                if toolCallTurnIndex < rawToolCallContents.count {
+                    messages.append(rawToolCallContents[toolCallTurnIndex])
+                } else {
+                    let functionCallParts: [GeminiPart] = toolCalls.map { call in
+                        let args = try? fromGeneratedContent(call.arguments)
+                        return .functionCall(GeminiFunctionCall(name: call.toolName, args: args), thoughtSignature: nil)
+                    }
+                    messages.append(
+                        .init(
+                            role: .model,
+                            parts: functionCallParts
+                        )
                     )
-                )
+                }
+                toolCallTurnIndex += 1
             case .toolOutput(let toolOutput):
                 // Add function response as a user message (Gemini API expects function responses from user role)
                 let response = try? toJSONValue(toolOutput)
@@ -895,7 +912,7 @@ private struct GeminiContent: Codable, Sendable {
 
 private enum GeminiPart: Codable, Sendable {
     case text(GeminiTextPart)
-    case functionCall(GeminiFunctionCall)
+    case functionCall(GeminiFunctionCall, thoughtSignature: String?)
     case functionResponse(GeminiFunctionResponse)
     case inlineData(GeminiInlineData)
     case fileData(GeminiFileData)
@@ -916,8 +933,13 @@ private enum GeminiPart: Codable, Sendable {
             let text = try container.decode(String.self, forKey: .text)
             self = .text(GeminiTextPart(text: text))
         } else if container.contains(.functionCall) {
-            // Note: thoughtSignature may be present but is ignored
-            self = .functionCall(try container.decode(GeminiFunctionCall.self, forKey: .functionCall))
+            // Gemini 3 requires the thought signature to be echoed back on
+            // function-call parts in subsequent turns; dropping it makes the
+            // API reject the follow-up request with INVALID_ARGUMENT.
+            self = .functionCall(
+                try container.decode(GeminiFunctionCall.self, forKey: .functionCall),
+                thoughtSignature: try container.decodeIfPresent(String.self, forKey: .thoughtSignature)
+            )
         } else if container.contains(.functionResponse) {
             self = .functionResponse(try container.decode(GeminiFunctionResponse.self, forKey: .functionResponse))
         } else if container.contains(.inlineData) {
@@ -939,8 +961,9 @@ private enum GeminiPart: Codable, Sendable {
         switch self {
         case .text(let part):
             try container.encode(part.text, forKey: .text)
-        case .functionCall(let call):
+        case .functionCall(let call, let thoughtSignature):
             try container.encode(call, forKey: .functionCall)
+            try container.encodeIfPresent(thoughtSignature, forKey: .thoughtSignature)
         case .functionResponse(let response):
             try container.encode(response, forKey: .functionResponse)
         case .inlineData(let data):
